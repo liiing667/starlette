@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import math
 import zlib
-from typing import NoReturn
+from typing import ClassVar, NoReturn
 
 import anyio.lowlevel
 import anyio.to_thread
@@ -26,19 +27,73 @@ DEFAULT_EXCLUDED_CONTENT_TYPES = (
     "video/*",
 )
 
-_gzip_capacity_limiter: anyio.lowlevel.RunVar[anyio.CapacityLimiter] = anyio.lowlevel.RunVar("_gzip_capacity_limiter")
+_compression_capacity_limiter: anyio.lowlevel.RunVar[anyio.CapacityLimiter] = anyio.lowlevel.RunVar(
+    "_compression_capacity_limiter"
+)
+
+_SUPPORTED_CONTENT_ENCODINGS = ("gzip", "deflate", "identity")
 
 
-def _get_gzip_capacity_limiter() -> anyio.CapacityLimiter:
-    """Return the capacity limiter used for worker-thread GZip compression."""
+def _get_compression_capacity_limiter() -> anyio.CapacityLimiter:
+    """Return the capacity limiter used for worker-thread compression."""
     try:
-        return _gzip_capacity_limiter.get()
+        return _compression_capacity_limiter.get()
     except LookupError:
-        # Keep gzip compression isolated from AnyIO's default worker-thread
-        # capacity limiter while matching its default concurrency.
         limiter = anyio.CapacityLimiter(40)
-        _gzip_capacity_limiter.set(limiter)
+        _compression_capacity_limiter.set(limiter)
         return limiter
+
+
+def _select_content_encoding(accept_encoding: str) -> str | None:
+    accepted_qualities: dict[str, float] = {}
+    wildcard_quality: float | None = None
+
+    for field in accept_encoding.split(","):
+        coding, separator, parameters = field.partition(";")
+        coding = coding.strip().lower()
+        if not coding:
+            continue
+
+        quality = 1.0
+        if separator:
+            valid = True
+            for parameter in parameters.split(";"):
+                name, _has_value, value = parameter.partition("=")
+                if name.strip().lower() != "q":
+                    continue
+                try:
+                    quality = float(value.strip())
+                except ValueError:
+                    valid = False
+                    break
+                if not math.isfinite(quality) or not 0.0 <= quality <= 1.0:
+                    valid = False
+                    break
+            if not valid:
+                continue
+
+        if coding == "*":
+            if wildcard_quality is None:
+                wildcard_quality = quality
+        elif coding in _SUPPORTED_CONTENT_ENCODINGS and coding not in accepted_qualities:
+            accepted_qualities[coding] = quality
+
+    candidates: list[tuple[float, int, int, str]] = []
+    for preference, encoding in enumerate(_SUPPORTED_CONTENT_ENCODINGS):
+        selected_quality = accepted_qualities.get(encoding)
+        if selected_quality is None and wildcard_quality is not None:
+            selected_quality = wildcard_quality
+        if selected_quality is None and encoding == "identity":
+            selected_quality = 1.0
+        if selected_quality is None or selected_quality == 0.0:
+            continue
+
+        specificity = 1 if encoding in accepted_qualities else 0
+        candidates.append((selected_quality, specificity, -preference, encoding))
+
+    if not candidates:
+        return None
+    return max(candidates)[-1]
 
 
 class GZipMiddleware:
@@ -63,9 +118,11 @@ class GZipMiddleware:
             return
 
         headers = Headers(scope=scope)
+        content_encoding = _select_content_encoding(headers.get("Accept-Encoding", ""))
         responder: ASGIApp
-        if "gzip" in headers.get("Accept-Encoding", ""):
-            responder = GZipResponder(
+        if content_encoding in {"gzip", "deflate"}:
+            responder_class = GZipResponder if content_encoding == "gzip" else DeflateResponder
+            responder = responder_class(
                 self.app,
                 self.minimum_size,
                 compresslevel=self.compresslevel,
@@ -177,8 +234,9 @@ class IdentityResponder:
         return body
 
 
-class GZipResponder(IdentityResponder):
-    content_encoding = "gzip"
+class CompressedResponder(IdentityResponder):
+    content_encoding: str
+    wbits: ClassVar[int]
 
     def __init__(
         self,
@@ -198,13 +256,13 @@ class GZipResponder(IdentityResponder):
     @property
     def compressor(self) -> zlib._Compress:
         if self._compressor is None:
-            self._compressor = zlib.compressobj(self.compresslevel, zlib.DEFLATED, 16 + zlib.MAX_WBITS)
+            self._compressor = zlib.compressobj(self.compresslevel, zlib.DEFLATED, self.wbits)
         return self._compressor
 
     async def apply_compression(self, body: bytes, *, more_body: bool) -> bytes:
         if len(body) >= self.thread_minimum_size:
             # Compressing large chunks inline would block the event loop.
-            limiter = _get_gzip_capacity_limiter()
+            limiter = _get_compression_capacity_limiter()
             return await anyio.to_thread.run_sync(self._compress_body, body, more_body, limiter=limiter)
         return self._compress_body(body, more_body)
 
@@ -212,6 +270,16 @@ class GZipResponder(IdentityResponder):
         if more_body:
             return self.compressor.compress(body) + self.compressor.flush(zlib.Z_SYNC_FLUSH)
         return self.compressor.compress(body) + self.compressor.flush()
+
+
+class GZipResponder(CompressedResponder):
+    content_encoding = "gzip"
+    wbits = 16 + zlib.MAX_WBITS
+
+
+class DeflateResponder(CompressedResponder):
+    content_encoding = "deflate"
+    wbits = zlib.MAX_WBITS
 
 
 async def unattached_send(message: Message) -> NoReturn:
