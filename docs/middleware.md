@@ -335,7 +335,13 @@ header from bypassing the limit.
 
 ## GZipMiddleware
 
-Handles GZip responses for any request that includes `"gzip"` in the `Accept-Encoding` header.
+Handles compressed responses for any request whose `Accept-Encoding` header allows it.
+
+The middleware negotiates between `gzip`, `deflate` and `identity` based on the
+`q` values in the `Accept-Encoding` header, preferring `gzip`, then `deflate`,
+then `identity` on ties. `deflate` responses use the zlib (RFC 1950) wrapper,
+not the gzip container. Compressed and uncompressed responses both include
+`Vary: Accept-Encoding` so caches can distinguish them.
 
 The middleware will handle both standard and streaming responses.
 

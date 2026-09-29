@@ -424,3 +424,111 @@ def test_gzip_responder_normalizes_content_types(test_client_factory: TestClient
     assert response.status_code == 200
     assert response.content == b"x" * 4000
     assert "Content-Encoding" not in response.headers
+
+
+def test_deflate_responses(test_client_factory: TestClientFactory) -> None:
+    def homepage(request: Request) -> PlainTextResponse:
+        return PlainTextResponse("x" * 4000, status_code=200)
+
+    app = Starlette(
+        routes=[Route("/", endpoint=homepage)],
+        middleware=[Middleware(GZipMiddleware)],
+    )
+
+    client = test_client_factory(app)
+    response = client.get("/", headers={"accept-encoding": "deflate"})
+    assert response.status_code == 200
+    assert response.text == "x" * 4000
+    assert response.headers["Content-Encoding"] == "deflate"
+    assert response.headers["Vary"] == "Accept-Encoding"
+    assert int(response.headers["Content-Length"]) < 4000
+
+
+def test_deflate_uses_zlib_wrapper(test_client_factory: TestClientFactory) -> None:
+    async def app(scope: Scope, receive: Receive, send: Send) -> None:
+        await send({"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"text/plain")]})
+        await send({"type": "http.response.body", "body": b"x" * 4000})
+
+    middleware = GZipMiddleware(app)
+    events: list[Message] = []
+
+    async def recording_app(scope: Scope, receive: Receive, send: Send) -> None:
+        async def record(message: Message) -> None:
+            events.append(message)
+            await send(message)
+
+        await middleware(scope, receive, record)
+
+    client = test_client_factory(recording_app)
+    response = client.get("/", headers={"accept-encoding": "deflate"})
+    assert response.status_code == 200
+    assert response.headers["Content-Encoding"] == "deflate"
+
+    body = events[1]["body"]
+    # The body must use the zlib (RFC 1950) wrapper, not the gzip container.
+    assert zlib.decompress(body) == b"x" * 4000
+    with pytest.raises(zlib.error):
+        zlib.decompress(body, 16 + zlib.MAX_WBITS)
+
+
+def test_deflate_streaming_response(test_client_factory: TestClientFactory) -> None:
+    def homepage(request: Request) -> StreamingResponse:
+        async def generator(bytes: bytes, count: int) -> ContentStream:
+            for index in range(count):
+                yield bytes
+
+        streaming = generator(bytes=b"x" * 400, count=10)
+        return StreamingResponse(streaming, status_code=200)
+
+    app = Starlette(
+        routes=[Route("/", endpoint=homepage)],
+        middleware=[Middleware(GZipMiddleware)],
+    )
+
+    client = test_client_factory(app)
+    response = client.get("/", headers={"accept-encoding": "deflate"})
+    assert response.status_code == 200
+    assert response.text == "x" * 4000
+    assert response.headers["Content-Encoding"] == "deflate"
+    assert response.headers["Vary"] == "Accept-Encoding"
+    assert "Content-Length" not in response.headers
+
+
+@pytest.mark.parametrize(
+    ("accept_encoding", "expected_content_encoding"),
+    [
+        pytest.param("deflate;q=1.0, gzip;q=0.5", "deflate", id="deflate-preferred"),
+        pytest.param("gzip;q=1.0, deflate;q=0.5", "gzip", id="gzip-preferred"),
+        pytest.param("gzip;q=0.8, deflate;q=0.8, identity;q=0", "gzip", id="tie-prefers-gzip"),
+        pytest.param("deflate", "deflate", id="deflate-only"),
+        pytest.param("gzip;q=0, identity;q=0, deflate;q=0.5", "deflate", id="gzip-refused"),
+        pytest.param("identity;q=0, deflate;q=0.5", "deflate", id="identity-refused"),
+        pytest.param("gzip;q=0, deflate;q=0", None, id="all-compression-refused"),
+        pytest.param("gzip;q=0", None, id="gzip-refused-falls-back-to-identity"),
+        pytest.param("*;q=0.5, identity;q=0", "gzip", id="wildcard"),
+        pytest.param("gzip;q=0, identity;q=0, *;q=0.5", "deflate", id="wildcard-with-gzip-refused"),
+        pytest.param("GZip; Q=0.5, Deflate", "deflate", id="case-insensitive"),
+    ],
+)
+def test_accept_encoding_q_value_negotiation(
+    accept_encoding: str, expected_content_encoding: str | None, test_client_factory: TestClientFactory
+) -> None:
+    def homepage(request: Request) -> PlainTextResponse:
+        return PlainTextResponse("x" * 4000, status_code=200)
+
+    app = Starlette(
+        routes=[Route("/", endpoint=homepage)],
+        middleware=[Middleware(GZipMiddleware)],
+    )
+
+    client = test_client_factory(app)
+    response = client.get("/", headers={"accept-encoding": accept_encoding})
+    assert response.status_code == 200
+    assert response.text == "x" * 4000
+    assert response.headers["Vary"] == "Accept-Encoding"
+    if expected_content_encoding is None:
+        assert "Content-Encoding" not in response.headers
+        assert int(response.headers["Content-Length"]) == 4000
+    else:
+        assert response.headers["Content-Encoding"] == expected_content_encoding
+        assert int(response.headers["Content-Length"]) < 4000

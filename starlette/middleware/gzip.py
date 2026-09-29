@@ -64,8 +64,17 @@ class GZipMiddleware:
 
         headers = Headers(scope=scope)
         responder: ASGIApp
-        if "gzip" in headers.get("Accept-Encoding", ""):
+        encoding = _negotiate_encoding(headers.get("Accept-Encoding", ""))
+        if encoding == "gzip":
             responder = GZipResponder(
+                self.app,
+                self.minimum_size,
+                compresslevel=self.compresslevel,
+                thread_minimum_size=self.thread_minimum_size,
+                exclude_content_types=self.exclude_content_types,
+            )
+        elif encoding == "deflate":
+            responder = DeflateResponder(
                 self.app,
                 self.minimum_size,
                 compresslevel=self.compresslevel,
@@ -76,6 +85,51 @@ class GZipMiddleware:
             responder = IdentityResponder(self.app, self.minimum_size, exclude_content_types=self.exclude_content_types)
 
         await responder(scope, receive, send)
+
+
+def _negotiate_encoding(accept_encoding: str) -> str | None:
+    """Pick the best response encoding among gzip, deflate and identity.
+
+    The encoding with the highest q value wins. Ties are broken by server
+    preference: gzip, then deflate, then identity. Identity is assumed to be
+    acceptable unless it is explicitly refused with `q=0`.
+    """
+    qualities: dict[str, float] = {}
+    for part in accept_encoding.split(","):
+        token, _, params = part.strip().partition(";")
+        token = token.strip().lower()
+        if not token:
+            continue
+        quality = 1.0
+        for param in params.split(";"):
+            key, _, value = param.partition("=")
+            if key.strip().lower() == "q":
+                try:
+                    quality = float(value.strip())
+                except ValueError:
+                    quality = 0.0
+        qualities[token] = quality
+
+    wildcard = qualities.get("*")
+
+    def quality_of(encoding: str, default: float) -> float:
+        if encoding in qualities:
+            return qualities[encoding]
+        if wildcard is not None:
+            return wildcard
+        return default
+
+    candidates = (
+        ("gzip", quality_of("gzip", 0.0)),
+        ("deflate", quality_of("deflate", 0.0)),
+        ("identity", quality_of("identity", 1.0)),
+    )
+    # On equal q values prefer gzip, then deflate, then identity.
+    preference = {"gzip": 2, "deflate": 1, "identity": 0}
+    encoding, quality = max(candidates, key=lambda candidate: (candidate[1], preference[candidate[0]]))
+    if quality <= 0:
+        return None
+    return encoding
 
 
 class IdentityResponder:
@@ -179,6 +233,7 @@ class IdentityResponder:
 
 class GZipResponder(IdentityResponder):
     content_encoding = "gzip"
+    wbits = 16 + zlib.MAX_WBITS
 
     def __init__(
         self,
@@ -198,7 +253,7 @@ class GZipResponder(IdentityResponder):
     @property
     def compressor(self) -> zlib._Compress:
         if self._compressor is None:
-            self._compressor = zlib.compressobj(self.compresslevel, zlib.DEFLATED, 16 + zlib.MAX_WBITS)
+            self._compressor = zlib.compressobj(self.compresslevel, zlib.DEFLATED, self.wbits)
         return self._compressor
 
     async def apply_compression(self, body: bytes, *, more_body: bool) -> bytes:
@@ -212,6 +267,13 @@ class GZipResponder(IdentityResponder):
         if more_body:
             return self.compressor.compress(body) + self.compressor.flush(zlib.Z_SYNC_FLUSH)
         return self.compressor.compress(body) + self.compressor.flush()
+
+
+class DeflateResponder(GZipResponder):
+    """Compresses responses using the zlib (RFC 1950) deflate wrapper."""
+
+    content_encoding = "deflate"
+    wbits = zlib.MAX_WBITS
 
 
 async def unattached_send(message: Message) -> NoReturn:
